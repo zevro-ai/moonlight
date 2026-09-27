@@ -1,5 +1,8 @@
 #include "pyrowave.h"
 
+#include "streaming/session.h"
+#include "streaming/streamutils.h"
+
 #include <Limelight.h>
 #include <SDL.h>
 
@@ -7,6 +10,7 @@
 #include <pyrowave/pyrowave.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -34,6 +38,14 @@ PyrowaveVideoDecoder::PyrowaveVideoDecoder()
 }
 
 PyrowaveVideoDecoder::~PyrowaveVideoDecoder() {
+    if (Session::get() != nullptr) {
+        Session::get()->getOverlayManager().setOverlayRenderer(nullptr);
+    }
+    for (int i = 0; i < Overlay::OverlayMax; i++) {
+        if (m_OverlayTextures[i] != nullptr) {
+            SDL_DestroyTexture(m_OverlayTextures[i]);
+        }
+    }
     if (m_Decoder != nullptr) {
         pyrowave_decoder_destroy(static_cast<pyrowave_decoder>(m_Decoder));
         m_Decoder = nullptr;
@@ -118,6 +130,11 @@ bool PyrowaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
     m_Y.resize(m_Width * m_Height);
     m_U.resize((m_Width / 2) * (m_Height / 2));
     m_V.resize((m_Width / 2) * (m_Height / 2));
+    SDL_SetRenderDrawColor(m_Renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
+    if (Session::get() != nullptr) {
+        Session::get()->getOverlayManager().setOverlayRenderer(this);
+        Session::get()->flushWindowEvents();
+    }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave decoder %dx%d", m_Width, m_Height);
     return true;
 }
@@ -150,10 +167,154 @@ QSize PyrowaveVideoDecoder::getDecoderMaxResolution() {
     return QSize(3840, 2160);
 }
 
+void PyrowaveVideoDecoder::noteReceivedFrame(PDECODE_UNIT du) {
+    if (m_ActiveWndVideoStats.measurementStartUs == 0) {
+        m_ActiveWndVideoStats.measurementStartUs = LiGetMicroseconds();
+        m_LastFrameNumber = du->frameNumber;
+    }
+    else {
+        m_ActiveWndVideoStats.networkDroppedFrames += du->frameNumber - (m_LastFrameNumber + 1);
+        m_ActiveWndVideoStats.totalFrames += du->frameNumber - (m_LastFrameNumber + 1);
+        m_LastFrameNumber = du->frameNumber;
+    }
+
+    m_BwTracker.AddBytes(du->fullLength);
+    if (du->frameHostProcessingLatency != 0) {
+        if (m_ActiveWndVideoStats.minHostProcessingLatency != 0) {
+            m_ActiveWndVideoStats.minHostProcessingLatency = qMin(m_ActiveWndVideoStats.minHostProcessingLatency, du->frameHostProcessingLatency);
+        }
+        else {
+            m_ActiveWndVideoStats.minHostProcessingLatency = du->frameHostProcessingLatency;
+        }
+        m_ActiveWndVideoStats.framesWithHostProcessingLatency++;
+    }
+    m_ActiveWndVideoStats.maxHostProcessingLatency = qMax(m_ActiveWndVideoStats.maxHostProcessingLatency, du->frameHostProcessingLatency);
+    m_ActiveWndVideoStats.totalHostProcessingLatency += du->frameHostProcessingLatency;
+    m_ActiveWndVideoStats.receivedFrames++;
+    m_ActiveWndVideoStats.totalFrames++;
+
+    if (LiGetMicroseconds() > m_ActiveWndVideoStats.measurementStartUs + 1000000) {
+        publishStats();
+    }
+}
+
+void PyrowaveVideoDecoder::publishStats() {
+    VIDEO_STATS combined = m_LastWndVideoStats;
+    combined.receivedFrames += m_ActiveWndVideoStats.receivedFrames;
+    combined.decodedFrames += m_ActiveWndVideoStats.decodedFrames;
+    combined.renderedFrames += m_ActiveWndVideoStats.renderedFrames;
+    combined.totalFrames += m_ActiveWndVideoStats.totalFrames;
+    combined.networkDroppedFrames += m_ActiveWndVideoStats.networkDroppedFrames;
+    combined.totalDecodeTimeUs += m_ActiveWndVideoStats.totalDecodeTimeUs;
+    combined.totalRenderTimeUs += m_ActiveWndVideoStats.totalRenderTimeUs;
+    combined.totalHostProcessingLatency += m_ActiveWndVideoStats.totalHostProcessingLatency;
+    combined.framesWithHostProcessingLatency += m_ActiveWndVideoStats.framesWithHostProcessingLatency;
+    if (combined.minHostProcessingLatency == 0 ||
+            (m_ActiveWndVideoStats.minHostProcessingLatency != 0 &&
+             m_ActiveWndVideoStats.minHostProcessingLatency < combined.minHostProcessingLatency)) {
+        combined.minHostProcessingLatency = m_ActiveWndVideoStats.minHostProcessingLatency;
+    }
+    combined.maxHostProcessingLatency = qMax(combined.maxHostProcessingLatency, m_ActiveWndVideoStats.maxHostProcessingLatency);
+    if (combined.measurementStartUs == 0) {
+        combined.measurementStartUs = m_ActiveWndVideoStats.measurementStartUs;
+    }
+    if (!LiGetEstimatedRttInfo(&combined.lastRtt, &combined.lastRttVariance)) {
+        combined.lastRtt = 0;
+        combined.lastRttVariance = 0;
+    }
+
+    uint64_t now = LiGetMicroseconds();
+    double seconds = (double) (now - combined.measurementStartUs) / 1000000.0;
+    if (seconds > 0) {
+        combined.totalFps = (double) combined.totalFrames / seconds;
+        combined.receivedFps = (double) combined.receivedFrames / seconds;
+        combined.decodedFps = (double) combined.decodedFrames / seconds;
+        combined.renderedFps = (double) combined.renderedFrames / seconds;
+    }
+
+    SDL_memcpy(&m_LastWndVideoStats, &m_ActiveWndVideoStats, sizeof(m_ActiveWndVideoStats));
+    SDL_zero(m_ActiveWndVideoStats);
+    m_ActiveWndVideoStats.measurementStartUs = now;
+
+    if (Session::get() == nullptr || !Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
+        return;
+    }
+
+    char text[1024];
+    char rtt[64] = "N/A";
+    if (combined.lastRtt != 0) {
+        snprintf(rtt, sizeof(rtt), "%u ms (variance: %u ms)", combined.lastRtt, combined.lastRttVariance);
+    }
+    double decodeMs = combined.decodedFrames ? (double) combined.totalDecodeTimeUs / 1000.0 / combined.decodedFrames : 0;
+    double renderMs = combined.renderedFrames ? (double) combined.totalRenderTimeUs / 1000.0 / combined.renderedFrames : 0;
+    double hostMs = combined.framesWithHostProcessingLatency ? (double) combined.totalHostProcessingLatency / 10.0 / combined.framesWithHostProcessingLatency : 0;
+    double dropped = combined.totalFrames ? (double) combined.networkDroppedFrames / combined.totalFrames * 100.0 : 0;
+    snprintf(text, sizeof(text),
+             "Video stream: %dx%d %.2f FPS (Codec: PyroWave)\n"
+             "Bitrate: %.1f Mbps, Peak (%us): %.1f\n"
+             "Incoming frame rate from network: %.2f FPS\n"
+             "Decoding frame rate: %.2f FPS\n"
+             "Rendering frame rate: %.2f FPS\n"
+             "Host processing latency min/max/average: %.1f/%.1f/%.1f ms\n"
+             "Frames dropped by your network connection: %.2f%%\n"
+             "Average network latency: %s\n"
+             "Average decoding time: %.2f ms\n"
+             "Average rendering time: %.2f ms\n",
+             m_Width, m_Height, combined.totalFps,
+             m_BwTracker.GetAverageMbps(), m_BwTracker.GetWindowSeconds(), m_BwTracker.GetPeakMbps(),
+             combined.receivedFps, combined.decodedFps, combined.renderedFps,
+             (float) combined.minHostProcessingLatency / 10, (float) combined.maxHostProcessingLatency / 10, hostMs,
+             dropped, rtt, decodeMs, renderMs);
+
+    Overlay::OverlayManager& overlay = Session::get()->getOverlayManager();
+    snprintf(overlay.getOverlayText(Overlay::OverlayDebug), overlay.getOverlayMaxTextLength(), "%s", text);
+    overlay.setOverlayTextUpdated(Overlay::OverlayDebug);
+}
+
+void PyrowaveVideoDecoder::notifyOverlayUpdated(Overlay::OverlayType) {
+}
+
+void PyrowaveVideoDecoder::renderOverlay(Overlay::OverlayType type) {
+    if (Session::get() == nullptr || !Session::get()->getOverlayManager().isOverlayEnabled(type)) {
+        return;
+    }
+
+    SDL_Surface* surface = Session::get()->getOverlayManager().getUpdatedOverlaySurface(type);
+    if (surface != nullptr) {
+        if (m_OverlayTextures[type] != nullptr) {
+            SDL_DestroyTexture(m_OverlayTextures[type]);
+        }
+        if (type == Overlay::OverlayStatusUpdate) {
+            SDL_Rect viewport;
+            SDL_RenderGetViewport(m_Renderer, &viewport);
+            m_OverlayRects[type].x = 0;
+            m_OverlayRects[type].y = viewport.h - surface->h;
+        }
+        else {
+            m_OverlayRects[type].x = 0;
+            m_OverlayRects[type].y = 0;
+        }
+        m_OverlayRects[type].w = surface->w;
+        m_OverlayRects[type].h = surface->h;
+        m_OverlayTextures[type] = SDL_CreateTextureFromSurface(m_Renderer, surface);
+        SDL_FreeSurface(surface);
+        if (m_OverlayTextures[type] != nullptr) {
+            SDL_SetTextureScaleMode(m_OverlayTextures[type], SDL_ScaleModeNearest);
+        }
+    }
+
+    if (m_OverlayTextures[type] != nullptr) {
+        SDL_RenderCopy(m_Renderer, m_OverlayTextures[type], nullptr, &m_OverlayRects[type]);
+    }
+}
+
 int PyrowaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
     if (m_TestOnly || m_Decoder == nullptr) {
         return DR_OK;
     }
+
+    noteReceivedFrame(du);
+    uint64_t decodeStart = LiGetMicroseconds();
 
     std::vector<uint8_t> payload;
     payload.reserve(du->fullLength);
@@ -215,6 +376,9 @@ int PyrowaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
         return DR_NEED_IDR;
     }
 
+    m_ActiveWndVideoStats.totalDecodeTimeUs += LiGetMicroseconds() - decodeStart;
+    m_ActiveWndVideoStats.decodedFrames++;
+
     SDL_LockMutex(m_FrameLock);
     m_Y = QByteArray(reinterpret_cast<const char*>(y.data()), (int) y.size());
     m_U = QByteArray(reinterpret_cast<const char*>(u.data()), (int) u.size());
@@ -247,9 +411,25 @@ void PyrowaveVideoDecoder::renderFrameOnMainThread() {
     m_FrameReady = false;
     SDL_UnlockMutex(m_FrameLock);
 
+    uint64_t renderStart = LiGetMicroseconds();
+    SDL_RenderSetViewport(m_Renderer, nullptr);
     SDL_RenderClear(m_Renderer);
+
+    SDL_Rect src = {0, 0, m_Width, m_Height};
+    SDL_Rect dst = {};
+    SDL_GetRendererOutputSize(m_Renderer, &dst.w, &dst.h);
+    StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
+    SDL_RenderSetViewport(m_Renderer, &dst);
     SDL_RenderCopy(m_Renderer, m_Texture, nullptr, nullptr);
+
+    SDL_RenderSetViewport(m_Renderer, nullptr);
+    for (int i = 0; i < Overlay::OverlayMax; i++) {
+        renderOverlay((Overlay::OverlayType) i);
+    }
     SDL_RenderPresent(m_Renderer);
+
+    m_ActiveWndVideoStats.totalRenderTimeUs += LiGetMicroseconds() - renderStart;
+    m_ActiveWndVideoStats.renderedFrames++;
 }
 
 void PyrowaveVideoDecoder::setHdrMode(bool) {
