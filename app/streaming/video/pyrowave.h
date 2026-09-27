@@ -27,7 +27,10 @@ private:
     void noteReceivedFrame(PDECODE_UNIT du);
     void publishStats();
     void renderOverlay(Overlay::OverlayType type);
+    bool recreateRenderer();
+    void videoDestinationRect(SDL_Rect* dst);
 
+    SDL_Window* m_Window = nullptr;
     SDL_Renderer* m_Renderer;
     SDL_Texture* m_Texture;
     SDL_Texture* m_OverlayTextures[Overlay::OverlayMax] = {};

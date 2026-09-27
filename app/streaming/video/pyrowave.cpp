@@ -103,28 +103,17 @@ bool PyrowaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
         return false;
     }
 
-    m_Renderer = SDL_CreateRenderer(params->window, -1, SDL_RENDERER_ACCELERATED);
-    if (m_Renderer == nullptr) {
-        m_Renderer = SDL_CreateRenderer(params->window, -1, SDL_RENDERER_SOFTWARE);
-    }
-    if (m_Renderer == nullptr) {
+    m_Window = params->window;
+    m_Width = params->width;
+    m_Height = params->height;
+    if (!recreateRenderer()) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL renderer failed: %s", SDL_GetError());
         pyrowave_decoder_destroy(decoder);
         pyrowave_device_destroy(device);
         return false;
     }
 
-    m_Texture = SDL_CreateTexture(m_Renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, params->width, params->height);
-    if (m_Texture == nullptr) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL YUV texture failed: %s", SDL_GetError());
-        pyrowave_decoder_destroy(decoder);
-        pyrowave_device_destroy(device);
-        return false;
-    }
-
     m_FrameLock = SDL_CreateMutex();
-    m_Width = params->width;
-    m_Height = params->height;
     m_Device = device;
     m_Decoder = decoder;
     m_Y.resize(m_Width * m_Height);
@@ -274,6 +263,66 @@ void PyrowaveVideoDecoder::publishStats() {
 void PyrowaveVideoDecoder::notifyOverlayUpdated(Overlay::OverlayType) {
 }
 
+bool PyrowaveVideoDecoder::recreateRenderer() {
+    if (m_Window == nullptr || m_Width < 2 || m_Height < 2) {
+        return false;
+    }
+
+    for (int i = 0; i < Overlay::OverlayMax; i++) {
+        if (m_OverlayTextures[i] != nullptr) {
+            SDL_DestroyTexture(m_OverlayTextures[i]);
+            m_OverlayTextures[i] = nullptr;
+        }
+    }
+    if (m_Texture != nullptr) {
+        SDL_DestroyTexture(m_Texture);
+        m_Texture = nullptr;
+    }
+    if (m_Renderer != nullptr) {
+        SDL_DestroyRenderer(m_Renderer);
+        m_Renderer = nullptr;
+    }
+
+    m_Renderer = SDL_CreateRenderer(m_Window, -1, SDL_RENDERER_ACCELERATED);
+    if (m_Renderer == nullptr) {
+        m_Renderer = SDL_CreateRenderer(m_Window, -1, SDL_RENDERER_SOFTWARE);
+    }
+    if (m_Renderer == nullptr) {
+        return false;
+    }
+
+    m_Texture = SDL_CreateTexture(m_Renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, m_Width, m_Height);
+    if (m_Texture == nullptr) {
+        SDL_DestroyRenderer(m_Renderer);
+        m_Renderer = nullptr;
+        return false;
+    }
+
+    SDL_SetRenderDrawColor(m_Renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
+    if (Session::get() != nullptr) {
+        Session::get()->flushWindowEvents();
+    }
+    return true;
+}
+
+void PyrowaveVideoDecoder::videoDestinationRect(SDL_Rect* dst) {
+    dst->x = 0;
+    dst->y = 0;
+    dst->w = 0;
+    dst->h = 0;
+
+    SDL_Window* window = m_Window != nullptr ? m_Window : SDL_RenderGetWindow(m_Renderer);
+    if (window != nullptr) {
+        SDL_GetWindowSizeInPixels(window, &dst->w, &dst->h);
+    }
+    if (dst->w <= 0 || dst->h <= 0) {
+        SDL_GetRendererOutputSize(m_Renderer, &dst->w, &dst->h);
+    }
+
+    SDL_Rect src = {0, 0, m_Width, m_Height};
+    StreamUtils::scaleSourceToDestinationSurface(&src, dst);
+}
+
 void PyrowaveVideoDecoder::renderOverlay(Overlay::OverlayType type) {
     if (Session::get() == nullptr || !Session::get()->getOverlayManager().isOverlayEnabled(type)) {
         return;
@@ -398,6 +447,20 @@ void PyrowaveVideoDecoder::renderFrameOnMainThread() {
         return;
     }
 
+    int windowW = 0;
+    int windowH = 0;
+    int outputW = 0;
+    int outputH = 0;
+    if (m_Window != nullptr) {
+        SDL_GetWindowSizeInPixels(m_Window, &windowW, &windowH);
+    }
+    SDL_GetRendererOutputSize(m_Renderer, &outputW, &outputH);
+    if (windowW > 0 && windowH > 0 && (windowW != outputW || windowH != outputH)) {
+        if (!recreateRenderer()) {
+            return;
+        }
+    }
+
     SDL_LockMutex(m_FrameLock);
     if (!m_FrameReady) {
         SDL_UnlockMutex(m_FrameLock);
@@ -412,17 +475,13 @@ void PyrowaveVideoDecoder::renderFrameOnMainThread() {
     SDL_UnlockMutex(m_FrameLock);
 
     uint64_t renderStart = LiGetMicroseconds();
+    SDL_SetRenderDrawColor(m_Renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
     SDL_RenderSetViewport(m_Renderer, nullptr);
     SDL_RenderClear(m_Renderer);
 
-    SDL_Rect src = {0, 0, m_Width, m_Height};
     SDL_Rect dst = {};
-    SDL_GetRendererOutputSize(m_Renderer, &dst.w, &dst.h);
-    StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
-    SDL_RenderSetViewport(m_Renderer, &dst);
-    SDL_RenderCopy(m_Renderer, m_Texture, nullptr, nullptr);
-
-    SDL_RenderSetViewport(m_Renderer, nullptr);
+    videoDestinationRect(&dst);
+    SDL_RenderCopy(m_Renderer, m_Texture, nullptr, &dst);
     for (int i = 0; i < Overlay::OverlayMax; i++) {
         renderOverlay((Overlay::OverlayType) i);
     }
@@ -435,6 +494,9 @@ void PyrowaveVideoDecoder::renderFrameOnMainThread() {
 void PyrowaveVideoDecoder::setHdrMode(bool) {
 }
 
-bool PyrowaveVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO) {
+bool PyrowaveVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info) {
+    if (info != nullptr && (info->stateChangeFlags & WINDOW_STATE_CHANGE_SIZE) && m_Renderer != nullptr) {
+        recreateRenderer();
+    }
     return true;
 }
