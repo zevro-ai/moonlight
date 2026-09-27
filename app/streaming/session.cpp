@@ -11,6 +11,10 @@
 #include "video/ffmpeg.h"
 #endif
 
+#ifdef HAVE_PYROWAVE
+#include "video/pyrowave.h"
+#endif
+
 #ifdef HAVE_SLVIDEO
 #include "video/slvid.h"
 #endif
@@ -301,6 +305,24 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "V-sync %s",
                 enableVsync ? "enabled" : "disabled");
+
+#ifdef HAVE_PYROWAVE
+    if (videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+        chosenDecoder = new PyrowaveVideoDecoder();
+        if (chosenDecoder->initialize(&params)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "PyroWave video decoder chosen");
+            return true;
+        }
+        else {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Unable to load PyroWave decoder");
+            delete chosenDecoder;
+            chosenDecoder = nullptr;
+            return false;
+        }
+    }
+#endif
 
 #ifdef HAVE_SLVIDEO
     chosenDecoder = new SLVideoDecoder(testOnly);
@@ -730,7 +752,11 @@ bool Session::initialize(QQuickWindow* qtWindow)
                 "Audio channel mask: %X",
                 CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(m_StreamConfig.audioConfiguration));
 
-    // Start with all codecs and profiles in priority order
+    // Start with all codecs and profiles in priority order.
+    // PyroWave is moved back to the front after profile filtering when the host advertises it.
+#ifdef HAVE_PYROWAVE
+    m_SupportedVideoFormats.append(VIDEO_FORMAT_PYROWAVE);
+#endif
     m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_HIGH10_444);
     m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_MAIN10);
     m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_REXT10_444);
@@ -942,6 +968,15 @@ bool Session::initialize(QQuickWindow* qtWindow)
     bool ret = validateLaunch(testWindow);
 
     if (ret) {
+#ifdef HAVE_PYROWAVE
+        // Prefer PyroWave for SDR 4:2:0. HDR and 4:4:4 stay on the existing codecs.
+        if (!m_Preferences->enableHdr && !m_Preferences->enableYUV444 &&
+                m_SupportedVideoFormats.contains(VIDEO_FORMAT_PYROWAVE)) {
+            m_SupportedVideoFormats.removeAll(VIDEO_FORMAT_PYROWAVE);
+            m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE);
+        }
+#endif
+
         // Video format is now locked in
         m_StreamConfig.supportedVideoFormats = m_SupportedVideoFormats.front();
 

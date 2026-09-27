@@ -146,6 +146,23 @@ unix:if(!macx|disable-prebuilts) {
                 PKGCONFIG += x11
             }
         }
+
+        isEmpty(PYROWAVE_PREFIX): PYROWAVE_PREFIX = $$(HOME)/opt/pyrowave
+        exists($$PYROWAVE_PREFIX/lib64/libpyrowave-shared.so) {
+            PYROWAVE_LIBDIR = $$PYROWAVE_PREFIX/lib64
+        }
+        exists($$PYROWAVE_PREFIX/lib/libpyrowave-shared.so) {
+            PYROWAVE_LIBDIR = $$PYROWAVE_PREFIX/lib
+        }
+        !isEmpty(PYROWAVE_LIBDIR) {
+            message("Using PyroWave from $$PYROWAVE_LIBDIR")
+            INCLUDEPATH += $$PYROWAVE_PREFIX/include
+            LIBS += -L$$PYROWAVE_LIBDIR -lpyrowave-shared -lvulkan
+            QMAKE_RPATHDIR += $$PYROWAVE_LIBDIR
+            DEFINES += HAVE_PYROWAVE
+            SOURCES += streaming/video/pyrowave.cpp
+            HEADERS += streaming/video/pyrowave.h
+        }
     }
 }
 win32 {
