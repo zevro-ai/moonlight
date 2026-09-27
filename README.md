@@ -1,5 +1,11 @@
 # Moonlight PC
 
+## PyroWave fork
+
+This fork exists to add [PyroWave](https://github.com/Themaister/pyrowave) support to Moonlight. Stock Moonlight does not negotiate this codec. The matching host is [zevro-ai/sunshine](https://github.com/zevro-ai/sunshine/tree/pyrowave) (`pyrowave` branch). The protocol bits are in the [zevro-ai/moonlight-common-c](https://github.com/zevro-ai/moonlight-common-c) submodule.
+
+Install `libpyrowave` under `~/opt/pyrowave` before running qmake. `PYROWAVE_PREFIX` overrides that path. In settings, leave the codec on Automatic and turn HDR and YUV 4:4:4 off. The bitrate slider goes up to 500 Mbit/s. Decoding is 8-bit 4:2:0 only.
+
 [Moonlight PC](https://moonlight-stream.org) is an open source PC client for NVIDIA GameStream and [Sunshine](https://github.com/LizardByte/Sunshine).
 
 Moonlight also has mobile versions for [Android](https://github.com/moonlight-stream/moonlight-android) and [iOS](https://github.com/moonlight-stream/moonlight-ios).
